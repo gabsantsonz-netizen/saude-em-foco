@@ -1,17 +1,41 @@
 import { createServerClient } from '@supabase/ssr'
 import { NextResponse, type NextRequest } from 'next/server'
 
-export async function updateSession(request: NextRequest) {
-  let supabaseResponse = NextResponse.next({
-    request,
-  })
+// Validar variáveis de ambiente necessárias para o Supabase
+function validateEnvironmentVariables(): {
+  url: string
+  anonKey: string
+} {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL
+  const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
 
-  // With Fluid compute, don't put this client in a global environment
-  // variable. Always create a new one on each request.
-  const supabase = createServerClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-    {
+  if (!url) {
+    throw new Error(
+      'NEXT_PUBLIC_SUPABASE_URL não está definido. Verifique as variáveis de ambiente no Vercel.',
+    )
+  }
+
+  if (!anonKey) {
+    throw new Error(
+      'NEXT_PUBLIC_SUPABASE_ANON_KEY não está definido. Verifique as variáveis de ambiente no Vercel.',
+    )
+  }
+
+  return { url, anonKey }
+}
+
+export async function updateSession(request: NextRequest) {
+  try {
+    // Validar variáveis de ambiente
+    const { url, anonKey } = validateEnvironmentVariables()
+
+    let supabaseResponse = NextResponse.next({
+      request,
+    })
+
+    // Com Edge Runtime, sempre criar um novo cliente em cada requisição
+    // Isso evita problemas com estado compartilhado
+    const supabase = createServerClient(url, anonKey, {
       cookies: {
         getAll() {
           return request.cookies.getAll()
@@ -28,42 +52,53 @@ export async function updateSession(request: NextRequest) {
           )
         },
       },
-    },
-  )
+    })
 
-  // Do not run code between createServerClient and
-  // supabase.auth.getUser(). A simple mistake could make it very hard to debug
-  // issues with users being randomly logged out.
+    // Não executar código entre createServerClient e supabase.auth.getUser()
+    // Um erro simples aqui pode fazer usuários saírem aleatoriamente
+    const {
+      data: { user },
+    } = await supabase.auth.getUser()
 
-  // IMPORTANT: If you remove getUser() and you use server-side rendering
-  // with the Supabase client, your users may be randomly logged out.
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
+    // Redirecionar para login se acessar rota protegida sem autenticação
+    if (
+      request.nextUrl.pathname.startsWith('/protected') &&
+      !user
+    ) {
+      const url = request.nextUrl.clone()
+      url.pathname = '/auth/login'
+      return NextResponse.redirect(url)
+    }
 
-  if (
-    // if the user is not logged in and the app path, in this case, /protected, is accessed, redirect to the login page
-    request.nextUrl.pathname.startsWith('/protected') &&
-    !user
-  ) {
-    // no user, potentially respond by redirecting the user to the login page
-    const url = request.nextUrl.clone()
-    url.pathname = '/auth/login'
-    return NextResponse.redirect(url)
+    // IMPORTANTE: Retornar o objeto supabaseResponse com cookies intactos
+    // Se criar um novo NextResponse, copiar os cookies:
+    // 1. myNewResponse = NextResponse.next({ request })
+    // 2. myNewResponse.cookies.setAll(supabaseResponse.cookies.getAll())
+    // 3. Fazer mudanças em myNewResponse
+    // 4. return myNewResponse
+    // Caso contrário, a sessão do usuário pode ser encerrada prematuramente
+
+    return supabaseResponse
+  } catch (error) {
+    // Tratamento de erro para compatibilidade com Edge Runtime
+    console.error('[Middleware Error]', error)
+
+    // Se as variáveis de ambiente não estão configuradas, retornar erro 500
+    // Em produção no Vercel, as variáveis devem estar definidas
+    if (
+      error instanceof Error &&
+      error.message.includes('NEXT_PUBLIC_SUPABASE')
+    ) {
+      return NextResponse.json(
+        {
+          error: 'Configuração de Supabase inválida. Verifique as variáveis de ambiente.',
+        },
+        { status: 500 },
+      )
+    }
+
+    // Para outros erros, continuar com a requisição
+    // Isso evita que o middleware pare toda a aplicação
+    return NextResponse.next({ request })
   }
-
-  // IMPORTANT: You *must* return the supabaseResponse object as it is.
-  // If you're creating a new response object with NextResponse.next() make sure to:
-  // 1. Pass the request in it, like so:
-  //    const myNewResponse = NextResponse.next({ request })
-  // 2. Copy over the cookies, like so:
-  //    myNewResponse.cookies.setAll(supabaseResponse.cookies.getAll())
-  // 3. Change the myNewResponse object to fit your needs, but avoid changing
-  //    the cookies!
-  // 4. Finally:
-  //    return myNewResponse
-  // If this is not done, you may be causing the browser and server to go out
-  // of sync and terminate the user's session prematurely!
-
-  return supabaseResponse
 }
